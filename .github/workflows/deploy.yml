@@ -1,0 +1,45 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        working-directory: ./frontend
+        run: |
+          PORT=3000 BASE_PATH=/ pnpm run build
+        env:
+          NODE_ENV: production
+
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 141.140.0.233
+          username: root
+          password: ${{ secrets.VPS_PASSWORD }}
+          timeout: 600s
+          script: |
+            cd /opt/retinaguard
+            git pull origin main
+            docker compose build --no-cache
+            docker compose up -d
+            echo "Deployed successfully!"
