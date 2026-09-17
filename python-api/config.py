@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # 6. إعدادات البريد الإلكتروني
     EMAIL_USER: str = os.getenv("EMAIL_USER", "osmanibrahim6062@gmail.com")
     EMAIL_PASS: str = os.getenv("EMAIL_PASS", "cdabaitqldlpjwsv")
+    SMTP_HOST: str = os.getenv("SMTP_HOST", "smtp-relay.brevo.com")
+    SMTP_PORT: int = int(os.getenv("SMTP_PORT", "2525"))
+    BREVO_API_KEY: str = os.getenv("BREVO_API_KEY", "")
     
     class Config:
         env_file = ".env"
