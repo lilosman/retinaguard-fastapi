@@ -260,7 +260,12 @@ async def register(body: RegisterBody, bg_tasks: BackgroundTasks):
     bg_tasks.add_task(send_verification_email, email_clean, body.name, code)
     print(f"[INFO] Verification code for {email_clean}: {code} (Demo master code: 123456)")
 
-    return {"message": "Account created. Check your email.", "userId": str(result.inserted_id)}
+    return {
+        "message": "Account created. Check your email.",
+        "userId": str(result.inserted_id),
+        "code": code,
+        "demoCode": "123456"
+    }
 
 @app.post("/api/auth/login")
 async def login_user(body: LoginBody):
@@ -344,8 +349,70 @@ async def resend_code(body: ResendBody, bg_tasks: BackgroundTasks):
     )
 
     bg_tasks.add_task(send_verification_email, email_clean, user.get("name", ""), code)
-    print(f"[INFO] Resent code for {email_clean}: {code} (Demo master code: 123456)")
-    return {"message": "New verification code sent"}
+    return {"message": "New verification code sent", "code": code, "demoCode": "123456"}
+
+
+class GoogleAuthBody(BaseModel):
+    credential: Optional[str] = None
+    email: Optional[str] = None
+    name: Optional[str] = None
+    picture: Optional[str] = None
+
+
+@app.post("/api/auth/google")
+async def google_auth(body: GoogleAuthBody):
+    users_col = get_collection("users")
+    email = None
+    name = body.name or "Google User"
+
+    if body.credential:
+        try:
+            from jose import jwt as jose_jwt
+            claims = jose_jwt.get_unverified_claims(body.credential)
+            email = claims.get("email")
+            name = claims.get("name", name)
+        except Exception as e:
+            print(f"[WARNING] Failed to decode Google credential: {e}")
+
+    if not email and body.email:
+        email = body.email
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Google authentication failed: email required")
+
+    email_clean = email.lower().strip()
+    user = await users_col.find_one({"email": email_clean})
+
+    if not user:
+        user_doc = {
+            "name": name,
+            "email": email_clean,
+            "role": "patient",
+            "isVerified": True,
+            "authProvider": "google",
+            "createdAt": datetime.utcnow(),
+        }
+        res = await users_col.insert_one(user_doc)
+        user = await users_col.find_one({"_id": res.inserted_id})
+    else:
+        await users_col.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"isVerified": True, "authProvider": "google"}},
+        )
+
+    token = create_access_token({"sub": str(user["_id"]), "role": user.get("role", "patient")})
+    return {
+        "message": "Google authentication successful",
+        "token": token,
+        "user": {
+            "id": str(user["_id"]),
+            "name": user.get("name", name),
+            "email": user.get("email", email_clean),
+            "role": user.get("role", "patient"),
+            "age": user.get("age"),
+            "gender": user.get("gender", ""),
+        },
+    }
 
 
 @app.post("/predict")
