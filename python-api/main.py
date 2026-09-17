@@ -374,16 +374,36 @@ async def predict(
 
         # تحديد هوية المريض
         effective_patient_id = "guest_patient"
+        patient_name = "Patient"
+        patient_email = ""
         if current_user and "_id" in current_user:
             effective_patient_id = current_user["_id"]
+            patient_name = current_user.get("name", "Patient")
+            patient_email = current_user.get("email", "")
         elif patient_id:
             effective_patient_id = patient_id
+
+        # فحص نسبة الخطورة (إذا كانت >= 85% أو High)
+        prob = float(result.get("probability", 0.0))
+        risk_lvl = result.get("riskLevel", "Low")
+        is_urgent = (prob >= 85.0 or risk_lvl == "High")
+
+        urgent_text = "سوف يتم التواصل معك على الإيميل من قبل الطبيب المختص لمتابعة حالتك بشكل عاجل."
+        if is_urgent:
+            result["isUrgent"] = True
+            result["urgentNotice"] = urgent_text
+            result["explanation"] = f"{result.get('explanation', '')}\n\n⚠️ تنبيه طبي عاجل: {urgent_text}"
+        else:
+            result["isUrgent"] = False
+            result["urgentNotice"] = None
 
         # 2. حفظ نتيجة الفحص في قاعدة البيانات MongoDB
         scans_collection = get_collection("scans")
         
         scan_doc = {
             "patientId": effective_patient_id,
+            "patientName": patient_name,
+            "patientEmail": patient_email,
             "imageUrl": f"data:{image.content_type};base64," + base64.b64encode(img_bytes).decode('utf-8'),
             "heatmapUrl": result.get("heatmapBase64", ""),
             "aiResult": {
@@ -391,7 +411,8 @@ async def predict(
                 "probability": result.get("probability", 0.0),
                 "explanation": result.get("explanation", "")
             },
-            "status": "pending",
+            "status": "Urgent Review Required" if is_urgent else "Pending",
+            "isUrgent": is_urgent,
             "doctorNote": None,
             "approvedBy": None,
             "uploadedAt": datetime.utcnow(),
@@ -416,7 +437,6 @@ async def get_my_scans(current_user: Optional[dict] = Depends(get_current_user))
     if current_user and "_id" in current_user:
         query = {"$or": [{"patientId": current_user["_id"]}, {"patientId": "guest_patient"}]}
     
-    # استثناء حقول الـ base64 الثقيلة لتسريع التحميل بمقدار 50x
     cursor = scans_col.find(
         query, 
         {"imageUrl": 0, "heatmapUrl": 0}
@@ -429,6 +449,93 @@ async def get_my_scans(current_user: Optional[dict] = Depends(get_current_user))
         if isinstance(s.get("uploadedAt"), datetime):
             s["uploadedAt"] = s["uploadedAt"].isoformat()
     return scans
+
+# ── Doctor Patients Directory (يعرض المرضى الحقيقيين والفحوصات مع تنبيه الحالات الحرجة) ──
+@app.get("/api/doctor/patients")
+async def get_doctor_patients_list():
+    scans_col = get_collection("scans")
+    users_col = get_collection("users")
+    
+    cursor = scans_col.find({}, {"imageUrl": 0, "heatmapUrl": 0}).sort("uploadedAt", -1)
+    scans = await cursor.to_list(length=100)
+    
+    users = await users_col.find({}, {"password": 0}).to_list(length=200)
+    user_map = {str(u["_id"]): u for u in users}
+    user_email_map = {u.get("email"): u for u in users if u.get("email")}
+    
+    patients_list = []
+    for s in scans:
+        p_id = str(s.get("patientId", ""))
+        u = user_map.get(p_id)
+        if not u and s.get("patientEmail"):
+            u = user_email_map.get(s.get("patientEmail"))
+            
+        name = s.get("patientName") or (u.get("name") if u else "Patient")
+        email = s.get("patientEmail") or (u.get("email") if u else "patient@retinaguard.com")
+        age = u.get("age") if u else 45
+        gender = u.get("gender") if u else "Male"
+        
+        ai = s.get("aiResult", {})
+        risk = ai.get("riskLevel", s.get("riskLevel", "Medium"))
+        prob = float(ai.get("probability", s.get("probability", 50.0)))
+        is_urgent = prob >= 85.0 or risk == "High" or s.get("isUrgent", False)
+        
+        dt = s.get("uploadedAt")
+        if isinstance(dt, datetime):
+            date_str = dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            date_str = str(dt)[:16] if dt else "Recently"
+            
+        patients_list.append({
+            "id": str(s["_id"]),
+            "scanId": str(s["_id"]),
+            "patientId": p_id,
+            "name": name,
+            "email": email,
+            "age": age,
+            "gender": gender,
+            "lastScan": date_str,
+            "risk": risk,
+            "probability": prob,
+            "confidence": prob,
+            "isUrgent": is_urgent,
+            "status": "Urgent Review Required" if is_urgent else (s.get("status", "Pending")),
+            "doctorNote": s.get("doctorNote"),
+            "approvedBy": s.get("approvedBy")
+        })
+    return patients_list
+
+@app.get("/api/scans/{scan_id}")
+async def get_single_scan_by_id(scan_id: str):
+    from bson import ObjectId
+    scans_col = get_collection("scans")
+    try:
+        oid = ObjectId(scan_id)
+    except Exception:
+        oid = scan_id
+    scan = await scans_col.find_one({"_id": oid})
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    scan["_id"] = str(scan["_id"])
+    if isinstance(scan.get("uploadedAt"), datetime):
+        scan["uploadedAt"] = scan["uploadedAt"].isoformat()
+    return scan
+
+@app.put("/api/scans/{scan_id}/note")
+async def save_doctor_scan_note(scan_id: str, payload: dict, current_user: Optional[dict] = Depends(get_current_user)):
+    from bson import ObjectId
+    scans_col = get_collection("scans")
+    try:
+        oid = ObjectId(scan_id)
+    except Exception:
+        oid = scan_id
+    note = payload.get("doctorNote", "")
+    doc_id = current_user.get("_id") if current_user else "doctor"
+    await scans_col.update_one(
+        {"_id": oid},
+        {"$set": {"doctorNote": note, "status": "Reviewed", "approvedBy": doc_id}}
+    )
+    return {"status": "ok", "message": "Doctor review saved"}
 
 # ══════════════════════════════════════════════════════════
 #  ADMIN & USER MANAGEMENT ENDPOINTS
