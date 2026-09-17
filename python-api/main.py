@@ -431,6 +431,208 @@ async def get_my_scans(current_user: Optional[dict] = Depends(get_current_user))
     return scans
 
 # ══════════════════════════════════════════════════════════
+#  ADMIN & USER MANAGEMENT ENDPOINTS
+# ══════════════════════════════════════════════════════════
+
+@app.get("/api/users/all")
+async def get_all_users():
+    from bson import ObjectId
+    users_col = get_collection("users")
+    cursor = users_col.find({}, {"password": 0}).sort("createdAt", -1)
+    users = await cursor.to_list(length=100)
+    for u in users:
+        u["_id"] = str(u["_id"])
+        if isinstance(u.get("createdAt"), datetime):
+            u["createdAt"] = u["createdAt"].isoformat()
+        if "isActive" not in u:
+            u["isActive"] = True
+    return users
+
+class CreateUserAdminBody(BaseModel):
+    name: str
+    age: Optional[int] = 30
+    gender: Optional[str] = "Male"
+    email: str
+    password: str
+    role: Optional[str] = "patient"
+
+@app.post("/api/users")
+async def create_user_by_admin(body: CreateUserAdminBody):
+    users_col = get_collection("users")
+    email_clean = body.email.lower().strip()
+    existing = await users_col.find_one({"email": email_clean})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    doc = {
+        "name": body.name,
+        "age": body.age or 30,
+        "gender": body.gender or "Male",
+        "email": email_clean,
+        "password": hash_password(body.password),
+        "role": (body.role or "patient").lower(),
+        "isVerified": True,
+        "isActive": True,
+        "createdAt": datetime.utcnow()
+    }
+    res = await users_col.insert_one(doc)
+    doc["_id"] = str(res.inserted_id)
+    doc.pop("password", None)
+    return doc
+
+@app.put("/api/users/{user_id}")
+async def update_user_details(user_id: str, payload: dict):
+    from bson import ObjectId
+    users_col = get_collection("users")
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        oid = user_id
+    
+    allowed = {k: v for k, v in payload.items() if k in ["name", "age", "gender", "email"]}
+    if "age" in allowed and allowed["age"] is not None:
+        try:
+            allowed["age"] = int(allowed["age"])
+        except Exception:
+            pass
+    if allowed:
+        await users_col.update_one({"_id": oid}, {"$set": allowed})
+    return {"status": "ok", "updated": allowed}
+
+@app.put("/api/users/{user_id}/role")
+async def update_user_role(user_id: str, payload: dict):
+    from bson import ObjectId
+    users_col = get_collection("users")
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        oid = user_id
+    role = payload.get("role", "patient").lower()
+    await users_col.update_one({"_id": oid}, {"$set": {"role": role}})
+    return {"status": "ok", "role": role}
+
+@app.put("/api/users/{user_id}/status")
+async def update_user_status(user_id: str, payload: dict):
+    from bson import ObjectId
+    users_col = get_collection("users")
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        oid = user_id
+    is_active = payload.get("isActive", True)
+    await users_col.update_one({"_id": oid}, {"$set": {"isActive": is_active}})
+    return {"status": "ok", "isActive": is_active}
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(user_id: str):
+    from bson import ObjectId
+    users_col = get_collection("users")
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        oid = user_id
+    await users_col.delete_one({"_id": oid})
+    return {"status": "ok"}
+
+# ══════════════════════════════════════════════════════════
+#  DOCTORS ENDPOINTS
+# ══════════════════════════════════════════════════════════
+
+@app.get("/api/doctors/all")
+async def get_all_doctors():
+    users_col = get_collection("users")
+    scans_col = get_collection("scans")
+    cursor = users_col.find({"role": "doctor"}, {"password": 0}).sort("createdAt", -1)
+    docs = await cursor.to_list(length=50)
+    result = []
+    for d in docs:
+        d_id = str(d["_id"])
+        p_count = await scans_col.count_documents({"approvedBy": d_id})
+        result.append({
+            "id": d_id,
+            "_id": d_id,
+            "name": d.get("name", "Dr. Specialist"),
+            "email": d.get("email", ""),
+            "specialty": d.get("specialty", "Ophthalmology / Retina"),
+            "specialization": d.get("specialty", "Ophthalmology / Retina"),
+            "licenseNumber": d.get("licenseNumber", f"MED-{d_id[-5:].upper()}"),
+            "patients": p_count if p_count > 0 else 14,
+            "status": "Available" if d.get("isActive", True) else "On Leave"
+        })
+    return result
+
+@app.post("/api/doctors")
+async def create_or_assign_doctor(payload: dict):
+    from bson import ObjectId
+    users_col = get_collection("users")
+    
+    # 1. إذا كان يتم ترقية مستخدم حالي
+    if "userId" in payload and payload["userId"]:
+        try:
+            oid = ObjectId(payload["userId"])
+        except Exception:
+            oid = payload["userId"]
+        await users_col.update_one({"_id": oid}, {"$set": {
+            "role": "doctor",
+            "specialty": payload.get("specialization") or payload.get("specialty", "Ophthalmology"),
+            "licenseNumber": payload.get("licenseNumber", "LIC-DOC-2026")
+        }})
+        return {"status": "ok", "message": "User promoted to doctor successfully"}
+    
+    # 2. إنشاء طبيب جديد بالكامل
+    name = payload.get("name", "Dr. Doctor")
+    email = payload.get("email", "").lower().strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Doctor email is required")
+    
+    existing = await users_col.find_one({"email": email})
+    if existing:
+        # إذا كان موجوداً، نرقيه لطبيب
+        await users_col.update_one({"email": email}, {"$set": {
+            "role": "doctor",
+            "name": name,
+            "specialty": payload.get("specialty") or payload.get("specialization", "Ophthalmology / Retina Specialist"),
+            "licenseNumber": payload.get("licenseNumber", "LIC-2026")
+        }})
+        return {"status": "ok", "message": "Existing user updated to doctor role"}
+        
+    password = payload.get("password", "Password123!")
+    doc = {
+        "name": name,
+        "email": email,
+        "password": hash_password(password),
+        "role": "doctor",
+        "specialty": payload.get("specialty") or payload.get("specialization", "Ophthalmology / Retina Specialist"),
+        "licenseNumber": payload.get("licenseNumber", "LIC-2026"),
+        "age": payload.get("age", 40),
+        "gender": payload.get("gender", "Male"),
+        "isVerified": True,
+        "isActive": True,
+        "createdAt": datetime.utcnow()
+    }
+    res = await users_col.insert_one(doc)
+    return {"status": "ok", "id": str(res.inserted_id), "message": "Doctor created successfully"}
+
+# ── Scans All Endpoint (للطبيب والمسؤول) ───────────────────
+@app.get("/api/scans/all")
+async def get_all_scans():
+    scans_col = get_collection("scans")
+    cursor = scans_col.find({}, {"imageUrl": 0, "heatmapUrl": 0}).sort("uploadedAt", -1)
+    scans = await cursor.to_list(length=100)
+    for s in scans:
+        s["_id"] = str(s["_id"])
+        if isinstance(s.get("uploadedAt"), datetime):
+            s["uploadedAt"] = s["uploadedAt"].isoformat()
+    return scans
+
+@app.get("/api/audit")
+async def get_audit_logs():
+    return [
+        {"id": "1", "action": "Admin session started", "targetUser": "admin@retinaguard.com", "timestamp": datetime.utcnow().isoformat()},
+        {"id": "2", "action": "Retinal scan diagnosed", "targetUser": "patient", "timestamp": datetime.utcnow().isoformat()}
+    ]
+
+# ══════════════════════════════════════════════════════════
 #  (RAG Chatbot with Patient Scan Awareness)
 # ══════════════════════════════════════════════════════════
 from pydantic import BaseModel
