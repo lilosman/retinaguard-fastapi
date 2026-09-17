@@ -501,15 +501,29 @@ async def predict(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
 
-# ── Scans History Endpoint (خفيف وسريع جداً في 0.05 ثانية) ────────
+# ── Scans History Endpoint (خفيف وسريع ويعرض فقط فحوصات المريض الحقيقية) ────────
 @app.get("/api/scans/my")
 async def get_my_scans(current_user: Optional[dict] = Depends(get_current_user)):
     scans_col = get_collection("scans")
     
-    query = {}
-    if current_user and "_id" in current_user:
-        query = {"$or": [{"patientId": current_user["_id"]}, {"patientId": "guest_patient"}]}
-    
+    if not current_user:
+        return []
+
+    p_id = current_user.get("_id")
+    p_email = current_user.get("email")
+
+    conditions = []
+    if p_id:
+        conditions.append({"patientId": p_id})
+        conditions.append({"patientId": str(p_id)})
+    if p_email:
+        conditions.append({"patientEmail": p_email})
+
+    if not conditions:
+        return []
+
+    query = {"$or": conditions}
+
     cursor = scans_col.find(
         query, 
         {"imageUrl": 0, "heatmapUrl": 0}
