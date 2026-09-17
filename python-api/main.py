@@ -383,16 +383,19 @@ async def predict(
         elif patient_id:
             effective_patient_id = patient_id
 
-        # فحص نسبة الخطورة (إذا كانت >= 85% أو High)
-        prob = float(result.get("probability", 0.0))
+        # فحص وجود المرض والخطورة (فقط لمن لديه DR ونسبة خطورة مرتفعة >= 85% أو High)
+        has_dr = bool(result.get("hasDR", False) or result.get("prediction") == "Has DR")
+        dr_prob = float(result.get("probabilities", {}).get("has_dr", (result.get("probability", 0.0) if has_dr else 0.0)))
         risk_lvl = result.get("riskLevel", "Low")
-        is_urgent = (prob >= 85.0 or risk_lvl == "High")
+        
+        # شرط التنبيه: المريض لديه DR حقيقي ونسبة خطورته >= 85% أو تصنيف High
+        is_urgent = bool(has_dr and risk_lvl != "Low" and (dr_prob >= 85.0 or risk_lvl == "High"))
 
-        urgent_text = "سوف يتم التواصل معك على الإيميل من قبل الطبيب المختص لمتابعة حالتك بشكل عاجل."
+        urgent_text_en = "Urgent Clinical Notice: High risk of Diabetic Retinopathy detected. A specialist doctor will contact you via email shortly for a priority follow-up."
         if is_urgent:
             result["isUrgent"] = True
-            result["urgentNotice"] = urgent_text
-            result["explanation"] = f"{result.get('explanation', '')}\n\n⚠️ تنبيه طبي عاجل: {urgent_text}"
+            result["urgentNotice"] = urgent_text_en
+            result["explanation"] = f"{result.get('explanation', '')}\n\n⚠️ {urgent_text_en}"
         else:
             result["isUrgent"] = False
             result["urgentNotice"] = None
@@ -406,9 +409,12 @@ async def predict(
             "patientEmail": patient_email,
             "imageUrl": f"data:{image.content_type};base64," + base64.b64encode(img_bytes).decode('utf-8'),
             "heatmapUrl": result.get("heatmapBase64", ""),
+            "hasDR": has_dr,
+            "prediction": result.get("prediction", "No DR"),
             "aiResult": {
                 "riskLevel": result.get("riskLevel", "Low"),
                 "probability": result.get("probability", 0.0),
+                "drProbability": dr_prob,
                 "explanation": result.get("explanation", "")
             },
             "status": "Urgent Review Required" if is_urgent else "Pending",
@@ -476,9 +482,13 @@ async def get_doctor_patients_list():
         gender = u.get("gender") if u else "Male"
         
         ai = s.get("aiResult", {})
-        risk = ai.get("riskLevel", s.get("riskLevel", "Medium"))
-        prob = float(ai.get("probability", s.get("probability", 50.0)))
-        is_urgent = prob >= 85.0 or risk == "High" or s.get("isUrgent", False)
+        risk = ai.get("riskLevel", s.get("riskLevel", "Low"))
+        prob = float(ai.get("probability", s.get("probability", 0.0)))
+        pred_label = s.get("prediction") or ai.get("prediction", "")
+        has_dr = s.get("hasDR", False) or (pred_label == "Has DR") or (risk in ["Medium", "High"])
+
+        # التنبيه فقط لمن لديه DR ونسبة خطورته مرتفعة (ممنوع التنبيه لمن ليس لديه DR)
+        is_urgent = bool(has_dr and risk != "Low" and (prob >= 85.0 or risk == "High"))
         
         dt = s.get("uploadedAt")
         if isinstance(dt, datetime):
