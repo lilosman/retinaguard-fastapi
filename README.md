@@ -199,5 +199,4 @@ retinaguard-fastapi/
 ### Medical Disclaimer
 RetinalGuard is developed as an **academic graduation project and clinical decision-support research tool**. It is intended to assist medical professionals and is not certified as an independent medical device. All diagnostic findings must be clinically evaluated and confirmed by a certified ophthalmologist.
 
-### License
-This project is open-source software licensed under the [MIT License](LICENSE).
+
