@@ -831,6 +831,146 @@ async def get_audit_logs():
     ]
 
 # ══════════════════════════════════════════════════════════
+#  DEVOPS / MLOPS MONITORING ENDPOINTS
+# ══════════════════════════════════════════════════════════
+
+import psutil
+import time
+from datetime import timedelta
+
+_server_start_time = time.time()
+
+@app.get("/api/devops/stats")
+async def devops_stats():
+    """Comprehensive DevOps / MLOps monitoring stats for the standalone dashboard."""
+    from bson import ObjectId
+    from collections import defaultdict
+
+    scans_col  = get_collection("scans")
+    users_col  = get_collection("users")
+
+    # ── 1. Model Performance ──────────────────────────────
+    all_scans = await scans_col.find(
+        {}, {"aiResult": 1, "uploadedAt": 1, "hasDR": 1, "patientId": 1}
+    ).to_list(length=1000)
+
+    total_preds   = len(all_scans)
+    dr_count      = 0
+    no_dr_count   = 0
+    risk_dist     = {"Low": 0, "Medium": 0, "High": 0}
+    conf_per_cat  = {"DR": [], "No DR": []}
+    daily_map     = defaultdict(int)   # date_str -> count
+    urgent_count  = 0
+
+    for s in all_scans:
+        ai = s.get("aiResult", {})
+        has_dr   = s.get("hasDR") or ai.get("hasDR") or (ai.get("prediction") == "Has DR")
+        risk     = ai.get("riskLevel", "Low")
+        prob     = float(ai.get("probability", 0.0))
+
+        if has_dr:
+            dr_count += 1
+            conf_per_cat["DR"].append(prob)
+        else:
+            no_dr_count += 1
+            conf_per_cat["No DR"].append(prob)
+
+        risk_dist[risk] = risk_dist.get(risk, 0) + 1
+
+        if has_dr and risk in ("Medium", "High") and prob >= 85.0:
+            urgent_count += 1
+
+        dt = s.get("uploadedAt")
+        if isinstance(dt, datetime):
+            day_key = dt.strftime("%Y-%m-%d")
+            daily_map[day_key] += 1
+
+    avg_conf_dr    = round(sum(conf_per_cat["DR"])    / max(1, len(conf_per_cat["DR"])),    1)
+    avg_conf_no_dr = round(sum(conf_per_cat["No DR"]) / max(1, len(conf_per_cat["No DR"])), 1)
+
+    # Daily volume — last 7 days
+    today = datetime.utcnow().date()
+    daily_volume = []
+    for i in range(6, -1, -1):
+        d = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+        daily_volume.append({"date": d, "count": daily_map.get(d, 0)})
+
+    # ── 2. User Stats ─────────────────────────────────────
+    total_users    = await users_col.count_documents({})
+    verified_users = await users_col.count_documents({"isVerified": True})
+    patient_count  = await users_col.count_documents({"role": "patient"})
+    doctor_count   = await users_col.count_documents({"role": "doctor"})
+    admin_count    = await users_col.count_documents({"role": "admin"})
+
+    # Recent registrations — last 7 days
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    new_users_week = await users_col.count_documents({"createdAt": {"$gte": week_ago}})
+
+    # ── 3. System Health ──────────────────────────────────
+    uptime_secs  = int(time.time() - _server_start_time)
+    uptime_str   = str(timedelta(seconds=uptime_secs))
+    cpu_pct      = psutil.cpu_percent(interval=0.2)
+    mem          = psutil.virtual_memory()
+    disk         = psutil.disk_usage("/")
+
+    # ── 4. Recent Prediction Logs (last 15, anonymised) ───
+    recent_scans = await scans_col.find(
+        {}, {"imageUrl": 0, "heatmapUrl": 0, "patientName": 0, "patientEmail": 0}
+    ).sort("uploadedAt", -1).to_list(length=15)
+
+    logs = []
+    for s in recent_scans:
+        ai  = s.get("aiResult", {})
+        dt  = s.get("uploadedAt")
+        ts  = dt.strftime("%Y-%m-%d %H:%M") if isinstance(dt, datetime) else str(dt)[:16]
+        logs.append({
+            "scanId":     str(s["_id"])[-8:],
+            "prediction": ai.get("prediction", s.get("prediction", "—")),
+            "riskLevel":  ai.get("riskLevel",  s.get("riskLevel",  "—")),
+            "confidence": round(float(ai.get("probability", 0)), 1),
+            "timestamp":  ts,
+        })
+
+    return {
+        "modelPerformance": {
+            "totalPredictions": total_preds,
+            "drPositive":       dr_count,
+            "noDR":             no_dr_count,
+            "drRate":           round(dr_count / max(1, total_preds) * 100, 1),
+            "noDrRate":         round(no_dr_count / max(1, total_preds) * 100, 1),
+            "avgConfidenceDR":   avg_conf_dr,
+            "avgConfidenceNoDR": avg_conf_no_dr,
+            "riskDistribution": risk_dist,
+            "urgentCases":       urgent_count,
+            "dailyVolume":       daily_volume,
+        },
+        "userStats": {
+            "totalUsers":     total_users,
+            "verifiedUsers":  verified_users,
+            "unverifiedUsers": total_users - verified_users,
+            "patients":       patient_count,
+            "doctors":        doctor_count,
+            "admins":         admin_count,
+            "newUsersThisWeek": new_users_week,
+        },
+        "systemHealth": {
+            "modelLoaded":    model is not None,
+            "mongoConnected": True,
+            "uptimeSeconds":  uptime_secs,
+            "uptimeFormatted": uptime_str,
+            "cpuPercent":     cpu_pct,
+            "memoryUsedMB":   round(mem.used / 1024 / 1024, 1),
+            "memoryTotalMB":  round(mem.total / 1024 / 1024, 1),
+            "memoryPercent":  mem.percent,
+            "diskUsedGB":     round(disk.used / 1024**3, 1),
+            "diskTotalGB":    round(disk.total / 1024**3, 1),
+            "diskPercent":    disk.percent,
+        },
+        "recentLogs": logs,
+    }
+
+
+# ══════════════════════════════════════════════════════════
 #  (RAG Chatbot with Patient Scan Awareness)
 # ══════════════════════════════════════════════════════════
 from pydantic import BaseModel
