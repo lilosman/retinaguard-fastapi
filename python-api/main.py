@@ -923,11 +923,21 @@ async def devops_stats():
         ai  = s.get("aiResult", {})
         dt  = s.get("uploadedAt")
         ts  = dt.strftime("%Y-%m-%d %H:%M") if isinstance(dt, datetime) else str(dt)[:16]
+        # Try to get a clean prediction label from multiple possible fields
+        pred = (
+            ai.get("prediction")
+            or s.get("prediction")
+            or ("Has DR" if (s.get("hasDR") or ai.get("hasDR")) else "No DR")
+        )
+        # Sanitise to ASCII-safe label in case of old garbled data
+        if not pred or not all(ord(c) < 128 for c in pred):
+            has_dr = s.get("hasDR") or ai.get("hasDR") or False
+            pred = "Has DR" if has_dr else "No DR"
         logs.append({
             "scanId":     str(s["_id"])[-8:],
-            "prediction": ai.get("prediction", s.get("prediction", "—")),
-            "riskLevel":  ai.get("riskLevel",  s.get("riskLevel",  "—")),
-            "confidence": round(float(ai.get("probability", 0)), 1),
+            "prediction": pred,
+            "riskLevel":  ai.get("riskLevel",  s.get("riskLevel",  "Low")),
+            "confidence": round(float(ai.get("probability", s.get("probability", 0))), 1),
             "timestamp":  ts,
         })
 
